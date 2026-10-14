@@ -1,0 +1,162 @@
+# CI/CD for the agentic RAG customer-support system.
+#   test   : install deps -> ruff lint -> pytest (retriever, tools, API)            [push + pull request]
+#   build  : build API + UI Docker images -> push to GitHub Container Registry       [push to main]
+#   deploy : run the new images on the Actions runner -> validate endpoints
+#            -> promote to :stable, or roll back to the previous :stable on failure  [push to main]
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt ruff pytest httpx
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Unit tests (pytest)
+        run: pytest -v
+
+  build:
+    name: Build & push Docker images
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image names (registry paths must be lowercase)
+        run: echo "PREFIX=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: api/Dockerfile
+          push: true
+          tags: ${{ env.PREFIX }}/api:${{ github.sha }},${{ env.PREFIX }}/api:latest
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+
+      - name: Build & push UI image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ui/Dockerfile
+          push: true
+          tags: ${{ env.PREFIX }}/ui:${{ github.sha }},${{ env.PREFIX }}/ui:latest
+          cache-from: type=gha,scope=ui
+          cache-to: type=gha,mode=max,scope=ui
+
+  deploy:
+    name: Deploy, validate & rollback
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      LLM_ENV: -e LLM_PROVIDER=openai -e LLM_MODEL=gpt-4o-mini -e LLM_REQUESTS_PER_MIN=200
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # without an OPENAI_API_KEY repository secret, /query is skipped and only /health + /feedback are validated
+      SMOKE_SKIP_LLM: ${{ secrets.OPENAI_API_KEY != '' && '0' || '1' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Image names
+        run: echo "PREFIX=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull new images and the previous stable release (if any)
+        run: |
+          docker pull "$PREFIX/api:${{ github.sha }}"
+          docker pull "$PREFIX/ui:${{ github.sha }}"
+          if docker pull "$PREFIX/api:stable" && docker pull "$PREFIX/ui:stable"; then
+            echo "HAS_STABLE=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_STABLE=false" >> "$GITHUB_ENV"; echo "No previous stable release yet"
+          fi
+
+      - name: Build the knowledge base (FAISS index) inside the API image
+        run: |
+          docker volume create rag-data
+          docker run --rm -v rag-data:/app/data "$PREFIX/api:${{ github.sha }}" python -m src.ingestion.build_index
+
+      - name: Deploy new release
+        run: |
+          docker network create rag-net
+          docker run -d --name rag-api --network rag-net -p 8000:8000 -v rag-data:/app/data \
+            $LLM_ENV -e OPENAI_API_KEY "$PREFIX/api:${{ github.sha }}"
+          docker run -d --name rag-ui --network rag-net -p 8501:8501 -e API_URL=http://rag-api:8000 \
+            "$PREFIX/ui:${{ github.sha }}"
+
+      - name: Validate deployment (endpoint smoke test)
+        run: |
+          pip install requests
+          python -m api.smoke_test http://localhost:8000
+          curl -fsS --retry 10 --retry-delay 3 --retry-all-errors http://localhost:8501/_stcore/health
+          echo " <- Streamlit UI healthy"
+
+      - name: Promote release to :stable
+        run: |
+          for svc in api ui; do
+            docker tag "$PREFIX/$svc:${{ github.sha }}" "$PREFIX/$svc:stable"
+            docker push "$PREFIX/$svc:stable"
+          done
+
+      - name: Show container logs
+        if: always()
+        run: docker logs rag-api --tail 100 || true
+
+      - name: Roll back to previous stable release
+        if: failure() && env.HAS_STABLE == 'true'
+        run: |
+          docker rm -f rag-api rag-ui || true
+          docker run -d --name rag-api --network rag-net -p 8000:8000 -v rag-data:/app/data \
+            $LLM_ENV -e OPENAI_API_KEY "$PREFIX/api:stable"
+          docker run -d --name rag-ui --network rag-net -p 8501:8501 -e API_URL=http://rag-api:8000 \
+            "$PREFIX/ui:stable"
+          SMOKE_SKIP_LLM=1 python -m api.smoke_test http://localhost:8000
+          echo "::warning::New release failed validation, rolled back to the previous :stable images"

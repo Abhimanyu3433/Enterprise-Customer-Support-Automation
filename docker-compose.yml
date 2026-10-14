@@ -1,0 +1,14 @@
+# Runs the API and the chat UI together:  docker compose up --build
+services:
+  api:
+    build: { context: ., dockerfile: api/Dockerfile }
+    env_file: .env
+    volumes:
+      - ./data:/app/data          # FAISS index + chunks built in Section 1, feedback is written here
+    ports: ["8000:8000"]
+  ui:
+    build: { context: ., dockerfile: ui/Dockerfile }
+    environment:
+      API_URL: http://api:8000
+    ports: ["8501:8501"]
+    depends_on: [api]

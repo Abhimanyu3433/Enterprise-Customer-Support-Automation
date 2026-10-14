@@ -1,0 +1,22 @@
+# Section 1 - RAG pipeline & agentic workflow
+langgraph
+langchain-core
+langchain-community
+langchain-openai
+langchain-google-genai
+langchain-huggingface
+langchain-text-splitters
+sentence-transformers
+faiss-cpu
+rank-bm25
+datasets
+pandas
+python-dotenv
+sacrebleu
+rouge-score
+tabulate
+# Section 2 - API & UI
+fastapi
+uvicorn
+streamlit
+requests
